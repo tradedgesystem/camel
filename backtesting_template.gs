@@ -1,112 +1,362 @@
 /**
- * Google Apps Script to create a futures backtesting Google Sheets template.
+ * Google Backtesting Sheet Generator
+ * MES-only (by default) with nicer UI:
+ * - Custom menu
+ * - Sidebar "builder" UI
+ * - Styled Trades sheet (banding, colors, conditional formatting)
+ * - Styled Summary sheet
  */
-const NUM_DAYS = 100;
-const TICKERS = ["MES", "M2K", "MYM", "MCL"];
-const TRADE_RESULTS = ["🟩 Green (Win)", "🟥 Red (Loss)", "⬛ Breakeven", "🚫 No Trade"];
+
+const DEFAULT_NUM_DAYS = 100;
+const DEFAULT_TICKER = "MES";   // default ticker
+const TRADE_RESULTS = [
+  "🟩 Green (Win)",
+  "🟥 Red (Loss)",
+  "⬛ Breakeven",
+  "🚫 No Trade",
+  "❌ Did Not Trade Ticker Today"
+];
 
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('Backtesting Template')
-    .addItem('Build/Reset Template', 'buildTemplate')
+    .addItem('Build / Reset (defaults)', 'buildTemplateWithDefaults')
+    .addItem('Open Template Builder…', 'openTemplateBuilder')
     .addToUi();
 }
 
-function buildTemplate() {
-  const tradingDays = generateTradingDays(NUM_DAYS);
-  createTradesSheet(tradingDays);
-  createSummarySheet();
+/**
+ * One-click version:
+ * - Start date = Nov 24 of current year
+ * - 100 trading days backward
+ * - Ticker = MES
+ */
+function buildTemplateWithDefaults() {
+  const ui = SpreadsheetApp.getUi();
+
+  const button = ui.alert(
+    'Rebuild template?',
+    'This will DELETE existing "Trades" and "Summary" sheets and recreate them with default settings.\n\nContinue?',
+    ui.ButtonSet.YES_NO
+  );
+  if (button !== ui.Button.YES) return;
+
+  const year = new Date().getFullYear();
+  const startDate = new Date(year, 10, 24); // yyyy-11-24
+
+  buildTemplate({
+    startDate,
+    numDays: DEFAULT_NUM_DAYS,
+    ticker: DEFAULT_TICKER
+  });
 }
 
-function resetTemplate() {
-  buildTemplate();
+/**
+ * Sidebar UI
+ */
+function openTemplateBuilder() {
+  const html = HtmlService.createHtmlOutputFromFile('BuilderSidebar')
+    .setTitle('Backtesting Template Builder');
+  SpreadsheetApp.getUi().showSidebar(html);
 }
 
-function generateTradingDays(daysToGenerate) {
+/**
+ * Called from sidebar
+ */
+function buildTemplateFromUI(formData) {
+  const ui = SpreadsheetApp.getUi();
+
+  try {
+    const numDaysRaw = Number(formData.numDays);
+    const numDays = (numDaysRaw && numDaysRaw > 0 && numDaysRaw <= 365)
+      ? numDaysRaw
+      : DEFAULT_NUM_DAYS;
+
+    const ticker = (formData.ticker || DEFAULT_TICKER).toString().toUpperCase();
+
+    let startDate;
+    if (formData.startDate) {
+      const parts = formData.startDate.split('-');
+      if (parts.length !== 3) throw new Error('Invalid start date.');
+      startDate = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+    } else {
+      const year = new Date().getFullYear();
+      startDate = new Date(year, 10, 24);
+    }
+
+    const confirm = ui.alert(
+      'Rebuild template?',
+      `This will DELETE existing "Trades" and "Summary" sheets and rebuild.\n\n` +
+      `Start date: ${startDate.toDateString()}\n` +
+      `Trading days: ${numDays}\n` +
+      `Ticker: ${ticker}\n\nContinue?`,
+      ui.ButtonSet.YES_NO
+    );
+    if (confirm !== ui.Button.YES) return;
+
+    buildTemplate({ startDate, numDays, ticker });
+
+  } catch (err) {
+    ui.alert('Invalid configuration', err.message, SpreadsheetApp.getUi().ButtonSet.OK);
+  }
+}
+
+/**
+ * Core builder
+ */
+function buildTemplate(config) {
+  const safeConfig = config || {};
+
+  const startDate = (safeConfig.startDate instanceof Date && !isNaN(safeConfig.startDate))
+    ? safeConfig.startDate
+    : new Date(new Date().getFullYear(), 10, 24);
+
+  const numDays = safeConfig.numDays || DEFAULT_NUM_DAYS;
+  const ticker = (safeConfig.ticker || DEFAULT_TICKER).toString().toUpperCase();
+
+  const tradingDays = generateTradingDays(startDate, numDays);
+  createTradesSheet(tradingDays, ticker);
+  createSummarySheet(ticker);
+}
+
+/**
+ * Generate structured day objects:
+ * { startDate: Date, endDate: Date, label: "YYYY-MM-DD" }
+ */
+function generateTradingDays(startDate, daysToGenerate) {
   const days = [];
-  let cursor = new Date();
+  let cursor = new Date(startDate);
+
   while (days.length < daysToGenerate) {
-    const day = new Date(cursor);
-    const dayOfWeek = day.getDay();
-    if (dayOfWeek !== 0 && dayOfWeek !== 6) {
-      days.push(new Date(day.getFullYear(), day.getMonth(), day.getDate()));
+    const dow = cursor.getDay();
+    if (dow !== 0 && dow !== 6) {
+      days.push({
+        startDate: new Date(cursor),
+        endDate: new Date(cursor),
+        label: Utilities.formatDate(
+          cursor,
+          Session.getScriptTimeZone(),
+          'yyyy-MM-dd'
+        )
+      });
     }
     cursor.setDate(cursor.getDate() - 1);
   }
-  return days.reverse();
+
+  return days;
 }
 
-function createTradesSheet(tradingDays) {
+/**
+ * Trades sheet
+ */
+function createTradesSheet(tradingDays, ticker) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheetName = 'Trades';
-  const existing = ss.getSheetByName(sheetName);
-  if (existing) {
-    ss.deleteSheet(existing);
-  }
-  const sheet = ss.insertSheet(sheetName, 0);
-  const headers = ['Date', 'Ticker', 'Trade Result', 'Points Risked', 'Points Result', 'Notes'];
-  sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+  const existing = ss.getSheetByName('Trades');
+  if (existing) ss.deleteSheet(existing);
+
+  const sheet = ss.insertSheet('Trades', 0);
+
+  const headers = [
+    'Date',
+    'Ticker',
+    'Time Taken',
+    'Trade Result',
+    'Points Risked',
+    'Points Result',
+    'Notes'
+  ];
+
+  const headerRange = sheet.getRange(1, 1, 1, headers.length);
+  headerRange
+    .setValues([headers])
+    .setFontWeight('bold')
+    .setBackground('#111827')
+    .setFontColor('#ffffff')
+    .setVerticalAlignment('middle');
+
+  sheet.setFrozenRows(1);
+  sheet.setFrozenColumns(1);
 
   const rows = [];
-  tradingDays.forEach((day) => {
-    TICKERS.forEach((ticker) => {
-      rows.push([day, ticker, '', '', '', '']);
-    });
+  tradingDays.forEach(day => {
+    rows.push([day.startDate, ticker, '', '', '', '', '']);
   });
-  if (rows.length > 0) {
-    sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
-  }
+
+  const dataRange = sheet.getRange(2, 1, rows.length, headers.length);
+  dataRange.setValues(rows);
+
+  const lastRow = 1 + rows.length;
 
   sheet.getRange(2, 1, rows.length, 1).setNumberFormat('yyyy-mm-dd');
+  sheet.getRange(2, 3, rows.length, 1).setNumberFormat('hh:mm');
+
   sheet.autoResizeColumns(1, headers.length);
 
+  sheet.getRange(1, 1, lastRow, headers.length)
+    .applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY);
+
+  // Data validation
   const rule = SpreadsheetApp.newDataValidation()
     .requireValueInList(TRADE_RESULTS, true)
     .setAllowInvalid(false)
     .build();
-  sheet.getRange(2, 3, rows.length, 1).setDataValidation(rule);
 
-  sheet.setFrozenRows(1);
-  return sheet;
+  const tradeResultRange = sheet.getRange(2, 4, rows.length, 1);
+  tradeResultRange.setDataValidation(rule);
+
+  // Conditional formatting
+  let rules = sheet.getConditionalFormatRules();
+
+  const addFormat = (match, bg, fg) => {
+    rules.push(
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenTextEqualTo(match)
+        .setBackground(bg)
+        .setFontColor(fg)
+        .setRanges([tradeResultRange])
+        .build()
+    );
+  };
+
+  addFormat("🟩 Green (Win)", '#d1fae5', '#065f46');
+  addFormat("🟥 Red (Loss)", '#fee2e2', '#991b1b');
+  addFormat("⬛ Breakeven", '#e5e7eb', '#111827');
+  addFormat("🚫 No Trade", '#fef3c7', '#92400e');
+  addFormat("❌ Did Not Trade Ticker Today", '#f3f4f6', '#4b5563');
+
+  sheet.setConditionalFormatRules(rules);
 }
 
-function createSummarySheet() {
+/**
+ * Summary sheet
+ */
+function createSummarySheet(ticker) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheetName = 'Summary';
-  const existing = ss.getSheetByName(sheetName);
-  if (existing) {
-    ss.deleteSheet(existing);
-  }
-  const summary = ss.insertSheet(sheetName, 1);
+  const existing = ss.getSheetByName('Summary');
+  if (existing) ss.deleteSheet(existing);
+
+  const summary = ss.insertSheet('Summary', 1);
 
   const metrics = [
     ['Metric', 'Value'],
-    ['Total trading days', '=COUNTA(UNIQUE(FILTER(Trades!A2:A,Trades!A2:A<>"")))'],
-    ['Number of no-trade days', '=LET(d,UNIQUE(FILTER(Trades!A2:A,Trades!A2:A<>"")),SUM(MAP(d,LAMBDA(x,IF(SUMPRODUCT((Trades!A2:A=x)*(Trades!C2:C<>"🚫 No Trade"))=0,1,0)))))'],
-    ['Total trades taken', '=COUNTIFS(Trades!C2:C,"<>🚫 No Trade",Trades!C2:C,"<>")'],
-    ['Total points gained/lost', '=SUM(FILTER(Trades!E2:E,Trades!C2:C<>"🚫 No Trade"))'],
-    ['Average points risked', '=AVERAGE(FILTER(Trades!D2:D,Trades!C2:C<>"🚫 No Trade",Trades!D2:D<>""))'],
-    ['Win/Loss ratio (excl. BE)', '=LET(w,COUNTIF(Trades!C2:C,"🟩 Green (Win)"),l,COUNTIF(Trades!C2:C,"🟥 Red (Loss)"),IF(l=0,"N/A",w/l))'],
-    ['Average points per winning trade', '=AVERAGE(FILTER(Trades!E2:E,Trades!C2:C="🟩 Green (Win)"))'],
-    ['Average points per losing trade', '=AVERAGE(FILTER(Trades!E2:E,Trades!C2:C="🟥 Red (Loss)"))'],
-    ['Most traded ticker', "=INDEX(SORT(QUERY(Trades!B2:C,'select B, count(C) where C <> \"🚫 No Trade\" group by B label count(C) \"\"',0),2,FALSE),1,1)"]
+
+    ['Total trading days',
+      '=COUNTA(UNIQUE(FILTER(Trades!A2:A,Trades!A2:A<>"")))'],
+
+    ['Number of no-trade days',
+      '=LET(d,UNIQUE(FILTER(Trades!A2:A,Trades!A2:A<>"")),' +
+      'SUM(MAP(d,LAMBDA(x,IF(SUMPRODUCT((Trades!A2:A=x)*' +
+      '((Trades!D2:D="🟩 Green (Win)")+(Trades!D2:D="🟥 Red (Loss)")+(Trades!D2:D="⬛ Breakeven"))) = 0,1,0)))))'
+    ],
+
+    ['Total trades taken',
+      '=COUNTIFS(Trades!D2:D,"🟩 Green (Win)")+' +
+      'COUNTIFS(Trades!D2:D,"🟥 Red (Loss)")+' +
+      'COUNTIFS(Trades!D2:D,"⬛ Breakeven")'
+    ],
+
+    ['Total points gained/lost',
+      '=SUM(FILTER(Trades!F2:F,(Trades!D2:D="🟩 Green (Win)")+' +
+      '(Trades!D2:D="🟥 Red (Loss)")+(Trades!D2:D="⬛ Breakeven")))'
+    ],
+
+    ['Average points risked',
+      '=AVERAGE(FILTER(Trades!E2:E,Trades!E2:E<>"",' +
+      '(Trades!D2:D="🟩 Green (Win)")+(Trades!D2:D="🟥 Red (Loss)")+' +
+      '(Trades!D2:D="⬛ Breakeven")))'
+    ],
+
+    ['Win/Loss ratio (excl BE)',
+      '=LET(w,COUNTIF(Trades!D2:D,"🟩 Green (Win)"),' +
+      'l,COUNTIF(Trades!D2:D,"🟥 Red (Loss)"),IF(l=0,"N/A",w/l))'
+    ],
+
+    ['Average points per winning trade',
+      '=AVERAGE(FILTER(Trades!F2:F,Trades!D2:D="🟩 Green (Win)"))'
+    ],
+
+    ['Average points per losing trade',
+      '=AVERAGE(FILTER(Trades!F2:F,Trades!D2:D="🟥 Red (Loss)"))'
+    ],
+
+    ['Average Trade Time (hh:mm)',
+      '=TEXT(AVERAGE(FILTER(Trades!C2:C,' +
+      '(Trades!D2:D="🟩 Green (Win)")+(Trades!D2:D="🟥 Red (Loss)")+' +
+      '(Trades!D2:D="⬛ Breakeven"))),"hh:mm")'
+    ],
+
+    ['Most traded ticker', ticker]
   ];
+
   summary.getRange(1, 1, metrics.length, 2).setValues(metrics);
 
-  summary.getRange('A12').setValue('Ticker Metrics').setFontWeight('bold');
-  summary.getRange('A13:F13').setValues([
-    ['Ticker', 'Wins', 'Losses', 'Total Trades', 'Win Rate', 'Total Points']
-  ]).setFontWeight('bold');
+  const header = summary.getRange('A1:B1');
+  header
+    .setFontWeight('bold')
+    .setBackground('#111827')
+    .setFontColor('#ffffff');
 
-  TICKERS.forEach((ticker, index) => {
-    const row = 14 + index;
-    summary.getRange(row, 1).setValue(ticker);
-    summary.getRange(row, 2).setFormula(`=COUNTIFS(Trades!B:B,"${ticker}",Trades!C:C,"🟩 Green (Win)")`);
-    summary.getRange(row, 3).setFormula(`=COUNTIFS(Trades!B:B,"${ticker}",Trades!C:C,"🟥 Red (Loss)")`);
-    summary.getRange(row, 4).setFormula(`=COUNTIFS(Trades!B:B,"${ticker}",Trades!C:C,"<>🚫 No Trade",Trades!C:C,"<>")`);
-    summary.getRange(row, 5).setFormula(`=IF(D${row}=0,0,B${row}/D${row})`);
-    summary.getRange(row, 6).setFormula(`=SUM(FILTER(Trades!E:E,Trades!B:B="${ticker}",Trades!C:C<>"🚫 No Trade"))`);
-  });
+  summary.getRange(1, 1, metrics.length, 2)
+    .applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY);
+
+  summary.autoResizeColumns(1, 2);
+
+  summary.getRange('A18').setValue('Ticker Metrics').setFontWeight('bold');
+
+  summary.getRange('A19:F19')
+    .setValues([['Ticker','Wins','Losses','Total Trades','Win Rate','Total Points']])
+    .setFontWeight('bold')
+    .setBackground('#111827')
+    .setFontColor('#ffffff');
+
+  summary.getRange('A20').setValue(ticker);
+
+  summary.getRange('B20').setFormula('=COUNTIFS(Trades!D:D,"🟩 Green (Win)")');
+  summary.getRange('C20').setFormula('=COUNTIFS(Trades!D:D,"🟥 Red (Loss)")');
+  summary.getRange('D20').setFormula(
+    '=COUNTIFS(Trades!D:D,"🟩 Green (Win)")+' +
+    'COUNTIFS(Trades!D:D,"🟥 Red (Loss)")+' +
+    'COUNTIFS(Trades!D:D,"⬛ Breakeven")'
+  );
+  summary.getRange('E20').setFormula('=IF(D20=0,0,B20/D20)');
+  summary.getRange('F20').setFormula(
+    '=SUM(FILTER(Trades!F:F,(Trades!D:D="🟩 Green (Win)")+' +
+    '(Trades!D:D="🟥 Red (Loss)")+(Trades!D:D="⬛ Breakeven")))'
+  );
+
+  summary.getRange('E20').setNumberFormat('0.0%');
+  summary.getRange('B20:D20').setNumberFormat('0.00');
+  summary.getRange('F20').setNumberFormat('0.00');
 
   summary.autoResizeColumns(1, 6);
+}
+
+/**
+ * Autofill
+ */
+function onEdit(e) {
+  const sheet = e.source.getActiveSheet();
+  if (sheet.getName() !== 'Trades') return;
+
+  const row = e.range.getRow();
+  const col = e.range.getColumn();
+
+  if (col !== 4 || row <= 1) return;
+
+  const val = e.range.getValue();
+  const nextRow = row + 1;
+  if (nextRow > sheet.getLastRow()) return;
+
+  const cell2 = sheet.getRange(nextRow, 4);
+
+  if (val === "❌ Did Not Trade Ticker Today") {
+    cell2.setValue("❌ Did Not Trade Ticker Today");
+    return;
+  }
+
+  const realTrades = ["🟩 Green (Win)", "🟥 Red (Loss)", "⬛ Breakeven"];
+  if (realTrades.includes(val)) {
+    cell2.setValue("🚫 No Trade");
+    return;
+  }
 }
