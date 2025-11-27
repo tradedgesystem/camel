@@ -49,77 +49,7 @@ function buildTemplateWithDefaults() {
     numDays: DEFAULT_NUM_DAYS,
     ticker: DEFAULT_TICKER
   });
-}
 
-/**
- * Sidebar UI
- */
-function openTemplateBuilder() {
-  const html = HtmlService.createHtmlOutputFromFile('BuilderSidebar')
-    .setTitle('Backtesting Template Builder');
-  SpreadsheetApp.getUi().showSidebar(html);
-}
-
-/**
- * Called from sidebar
- */
-function buildTemplateFromUI(formData) {
-  const ui = SpreadsheetApp.getUi();
-
-  try {
-    const numDaysRaw = Number(formData.numDays);
-    const numDays = (numDaysRaw && numDaysRaw > 0 && numDaysRaw <= 365)
-      ? numDaysRaw
-      : DEFAULT_NUM_DAYS;
-
-    const ticker = (formData.ticker || DEFAULT_TICKER).toString().toUpperCase();
-
-    let startDate;
-    if (formData.startDate) {
-      const parts = formData.startDate.split('-');
-      if (parts.length !== 3) throw new Error('Invalid start date.');
-      startDate = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
-    } else {
-      const year = new Date().getFullYear();
-      startDate = new Date(year, 10, 24);
-    }
-
-    const confirm = ui.alert(
-      'Rebuild template?',
-      `This will DELETE existing "Trades" and "Summary" sheets and rebuild.\n\n` +
-      `Start date: ${startDate.toDateString()}\n` +
-      `Trading days: ${numDays}\n` +
-      `Ticker: ${ticker}\n\nContinue?`,
-      ui.ButtonSet.YES_NO
-    );
-    if (confirm !== ui.Button.YES) return;
-
-    buildTemplate({ startDate, numDays, ticker });
-
-  } catch (err) {
-    ui.alert('Invalid configuration', err.message, SpreadsheetApp.getUi().ButtonSet.OK);
-  }
-}
-
-/**
- * Core builder
- */
-function buildTemplate(config) {
-  const safeConfig = config || {};
-
-  const startDate = (safeConfig.startDate instanceof Date && !isNaN(safeConfig.startDate))
-    ? safeConfig.startDate
-    : new Date(new Date().getFullYear(), 10, 24);
-
-  const numDays = safeConfig.numDays || DEFAULT_NUM_DAYS;
-  const ticker = (safeConfig.ticker || DEFAULT_TICKER).toString().toUpperCase();
-
-  const tradingDays = generateTradingDays(startDate, numDays);
-  createTradesSheet(tradingDays, ticker);
-  createSummarySheet(ticker);
-}
-
-/**
  * Generate structured day objects:
  * { startDate: Date, endDate: Date, label: "YYYY-MM-DD" }
  */
